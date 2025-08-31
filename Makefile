@@ -2,49 +2,47 @@
 # Assumes vbcc compiler is available
 
 CC = vc
-CFLAGS = -c99 -O2 -DAMIGA
-LIBS = -lamiga
+CFLAGS = -O2 -DAMIGA -I. -Wall -Wextra
+LIBS = -lamiga -lsocket
 
-# Library name
+# Library names
 LIBNAME = multitask.library
+STATIC_LIB = libmultitask.a
 
 # Source files
-SOURCES = multitask_lib.c
-STUBS = multitask_stubs.c
-HEADERS = multitask_lib.h
+SOURCES = multitask_lib.c amiga_networking.c
+HEADERS = multitask_lib.h amiga_networking.h
 
 # Object files
 OBJECTS = $(SOURCES:.c=.o)
 
-# Default target
-all: $(LIBNAME)
+# Default target - build static library
+all: $(STATIC_LIB)
 
-# Build the library
-$(LIBNAME): $(OBJECTS)
-	$(CC) $(CFLAGS) -o $(LIBNAME) $(OBJECTS) $(LIBS)
+# Build the static library
+$(STATIC_LIB): $(OBJECTS)
+	ar rcs $(STATIC_LIB) $(OBJECTS)
 
 # Compile source files
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Build stubs
-stubs: $(STUBS)
-	$(CC) $(CFLAGS) -c $(STUBS) -o multitask_stubs.o
+# Note: Building as static library - no stubs needed
 
 # Clean build files
 clean:
-	rm -f *.o $(LIBNAME)
+	rm -f *.o $(STATIC_LIB) test_program test_networking
 
-# Install library to Amiga system
-install: $(LIBNAME)
-	cp $(LIBNAME) /Amiga/Libs/
-
-# Test program
-test: test_program
+# Test programs
+test: test_program test_networking
 	./test_program
+	./test_networking
 
-# Build test program
-test_program: test_program.c multitask_stubs.o
-	$(CC) $(CFLAGS) -o test_program test_program.c multitask_stubs.o $(LIBS)
+# Build test programs
+test_program: test_program.c $(STATIC_LIB)
+	$(CC) $(CFLAGS) -o test_program test_program.c $(STATIC_LIB) $(LIBS)
 
-.PHONY: all clean install test stubs
+test_networking: test_networking.c $(STATIC_LIB)
+	$(CC) $(CFLAGS) -o test_networking test_networking.c $(STATIC_LIB) $(LIBS)
+
+.PHONY: all clean test test_program test_networking

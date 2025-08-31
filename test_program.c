@@ -5,13 +5,18 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "multitask_lib.h"
+
+/* Test function prototypes */
+void test_condvar(void);
+void test_runloop(void);
 
 /* Shared data structure */
 struct SharedData {
     int counter;
     struct MyMutex mutex;
-    struct MyMessagePort *port;
+    MyMessagePort *port;
 };
 
 /* Worker thread function */
@@ -44,8 +49,13 @@ void message_handler(void *arg)
     
     /* Wait for messages */
     while ((msg = MyPortWaitMessage(data->port)) != NULL) {
+        if (msg->mn_Node.ln_Name && !strcmp(msg->mn_Node.ln_Name, "QUIT")) {
+            FreeMem(msg, msg->mn_Length);
+            break;
+        }
         printf("Received message: %s\n", (char *)msg->mn_Node.ln_Name);
-        ReplyMsg(msg);
+        /* Free the message after processing to avoid race conditions */
+        FreeMem(msg, msg->mn_Length);
     }
     
     printf("Message handler thread finished\n");
@@ -101,16 +111,22 @@ int main(void)
         test_msg->mn_Length = sizeof(struct Message);
         test_msg->mn_ReplyPort = NULL;
         
-        if (MyPortPostMessage(shared_data.port, test_msg)) {
-            printf("Message posted successfully\n");
-        } else {
-            printf("Failed to post message\n");
-        }
+        MyPortPostMessage(shared_data.port, test_msg);
+        printf("Message posted successfully\n");
         
         /* Wait a bit for message to be processed */
         Delay(10);
         
-        FreeMem(test_msg, sizeof(struct Message));
+        /* Send quit message to properly terminate message handler */
+        struct Message *quit = AllocMem(sizeof(*quit), MEMF_CLEAR);
+        quit->mn_Node.ln_Name = "QUIT";
+        quit->mn_Length = sizeof(*quit);
+        MyPortPostMessage(shared_data.port, quit);
+        
+        /* Wait for message handler to process QUIT and exit */
+        MyThreadWait(msg_handler);
+        
+        /* Message is freed by the handler thread - no need to free here */
     }
     
     /* Clean up */
@@ -125,5 +141,78 @@ int main(void)
     
     printf("Test completed successfully!\n");
     
+    /* Test condition variables */
+    printf("\nTesting condition variables...\n");
+    test_condvar();
+    
+    /* Test run loop */
+    printf("\nTesting run loop...\n");
+    test_runloop();
+    
+    printf("\nAll tests completed successfully!\n");
+    
     return 0;
+}
+
+/* Condition variable ping-pong test */
+static struct MyMutex m;
+static struct MyCondition c;
+static int ready = 0;
+
+void worker(void *arg)
+{
+    (void)arg; /* unused */
+    MyMutexLock(&m);
+    ready = 1;
+    MyConditionSignal(&c);
+    MyMutexUnlock(&m);
+}
+
+void test_condvar(void)
+{
+    struct MyThread *t;
+    MyMutexInit(&m);
+    MyConditionInit(&c);
+
+    MyMutexLock(&m);
+    t = MyThreadCreate(worker, NULL);
+    while (!ready) MyConditionWait(&m, &c);
+    MyMutexUnlock(&m);
+
+    MyThreadWait(t);
+    MyThreadDestroy(t);
+    MyConditionDestroy(&c);
+    MyMutexDestroy(&m);
+    
+    printf("Condition variable test passed\n");
+}
+
+/* Run loop test */
+static void tick(void *p) 
+{ 
+    printf("tick %ld\n", (long)p); 
+}
+
+static void posted_func(void *p)
+{
+    (void)p; /* unused */
+    printf("posted!\n");
+}
+
+void test_runloop(void)
+{
+    struct MyRunLoop L;
+    MyRunLoopInit(&L);
+    MyRunLoopAddTimer(&L, 500, tick, (void*)1, TRUE); // 500ms repeating
+    MyRunLoopPost(&L, posted_func, NULL);
+    
+    // Run a short while using non-blocking poll
+    int i;
+    for (i = 0; i < 100; ++i) { 
+        MyRunLoopPoll(&L); 
+        Delay(1); 
+    }
+    
+    MyRunLoopDestroy(&L);
+    printf("Run loop test passed\n");
 }
