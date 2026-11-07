@@ -1,36 +1,58 @@
 # Multitask Library Changelog
 
 ## Overview
-This document tracks all changes made to the AmigaOS 3.x multitask library during development. The library has evolved from basic threading primitives to a production-ready foundation for WebKit integration.
+This document tracks changes to the AmigaOS 3.x multitask library.
 
-## Final Production-Ready State (Current)
+## 2026-11: fixes for OdysseyWebBrowser on AmigaOS 3.x
 
-### ✅ **Threading System - 100% WTF-Ready**
+Found while bringing up [OdysseyWebBrowser for AmigaOS 3.x](https://github.com/themamboman/OdysseyWebBrowser-m68k).
+The browser now runs on this library under WinUAE.
+
+- **Threads are DOS processes**: `MyThreadCreate` uses `CreateNewProc` instead of `CreateTask`,
+  because WebKit threads call dos.library through the C library and libcurl.
+- **Safer start-up handoff**: the thread record is passed to the new process under a semaphore,
+  and the creator waits until the child has taken it.
+- **2 MB thread stacks** (was 256 KB) for JavaScriptCore.
+- **`MyThreadDetach()`**: release a thread without joining; the record is freed when it ends.
+- **`MyConditionTimedWait()`**: condition wait with a timeout in milliseconds.
+- **TLS for any task**: `MyTLSSet` keeps per-task storage for tasks the library did not create,
+  such as the main task, and now returns `BOOL`.
+- **Monotonic clock**: `amiga_now_ms()` reads timer.device's EClock instead of DOS `DateStamp`.
+  `ex_EClockFrequency` is ticks per second; an earlier version used it as microseconds per tick,
+  so the clock ran about 500,000 times too fast on PAL and timed waits expired at once.
+- **Tests**: `test_program.c` adds clock, condition-timeout, task-local TLS and detached-thread
+  tests (built, not yet run on their own).
+
+The sections below are earlier development notes. Their status claims predate any target build.
+
+## Historical Implementation Notes
+
+### Historical Threading Implementation Notes
 - **Race-free thread creation**: `Forbid()/Permit()` wrapper around `CreateTask` + `tc_UserData` assignment
 - **TLS destructors**: `MyTLSCreateWithDtor()`, `MyTLSCallDestructorsForCurrentThread()` called at thread exit
 - **Proper join semantics**: `MyThreadWait()` before `MyThreadDestroy()` with signal-based synchronization
 - **Volatile state flags**: `is_running` marked as `volatile` for proper memory visibility
 - **TLS key exhaustion**: Returns `0xFFFF` when `MAX_TLS_KEYS` (32) is exceeded
 
-### ✅ **Networking Stub - Production-Grade HTTP Client**
+### Networking Stub - HTTP Client
 - **Complete error handling**: 8 distinct error codes (-1 to -8) covering all failure modes
 - **Host header truncation protection**: Validates `hostLine` length before injection
 - **Receive error distinction**: Separates timeout/error (-8) from clean EOF (0 bytes)
 - **EINTR-safe I/O**: Robust `recv` loop with proper retry logic
 - **Partial send detection**: Returns -7 if full request isn't transmitted
 - **Post-cleanup error reporting**: `http_last_errno()` caches errors before `SocketBase` cleanup
-- **Professional HTTP headers**: Host:port formatting, Accept: */*, Accept-Encoding: identity, Connection: close, User-Agent
+- **HTTP headers**: Host:port formatting, Accept: */*, Accept-Encoding: identity, Connection: close, User-Agent
 - **HTTP parsing helpers**: `http_parse_response()`, `http_parse_status_and_length()`
 - **HTTP/1.1 support**: Full protocol compliance with chunked transfer encoding
 - **Chunked dechunker**: In-place processing of chunked responses
 
-### ✅ **Memory Management - Airtight**
+### Memory Management
 - **Per-thread destructors**: Automatic cleanup of TLS objects at thread exit
 - **Resource cleanup**: Consistent `SocketBase = NULL` on all error paths
 - **Timer node cleanup**: `Remove()` before `FreeMem()` in `MyRunLoopDestroy`
 - **Condition variable hygiene**: Proper empty-list checks for `MinList`
 
-### ✅ **Build System - Development Quality**
+### Build System
 - **Warning flags**: `-Wall -Wextra` enabled for early bug detection
 - **Header hygiene**: Removed unused `<libraries/dos.h>` dependency
 - **Socket library linking**: `-lsocket` added for proper bsdsocket stubs
@@ -85,7 +107,7 @@ This document tracks all changes made to the AmigaOS 3.x multitask library durin
 - **Build warnings**: `-Wall -Wextra` for development quality
 - **Header hygiene**: Removed unused dependencies
 
-### **Phase 8: Production-Ready Error Handling**
+### **Phase 8: Error Handling**
 - **Named error constants**: `HTTP_ERR_*` defines for cleaner code and tests
 - **Host validation guard**: Treats empty host as resolve failure
 - **EINTR handling in send loop**: Symmetric with recv loop for robustness
@@ -114,7 +136,7 @@ This document tracks all changes made to the AmigaOS 3.x multitask library durin
 
 ## WTF Integration Checklist
 
-### ✅ **Memory Management - Complete**
+### Memory Management
 - [x] Per-thread destructors with automatic cleanup
 - [x] Race-free thread start with proper synchronization  
 - [x] Proper join semantics matching WTF expectations
@@ -123,7 +145,7 @@ This document tracks all changes made to the AmigaOS 3.x multitask library durin
 - [x] RunLoop/Timer system ready for WTF mapping
 - [x] Post-cleanup error reporting via cached errno
 
-### ✅ **Networking - Production-Ready**
+### Networking
 - [x] Host header truncation protection
 - [x] Receive error distinction (timeout vs EOF)
 - [x] Comprehensive error codes (-1 to -8)
@@ -132,7 +154,7 @@ This document tracks all changes made to the AmigaOS 3.x multitask library durin
 - [x] Consistent resource cleanup on all code paths
 - [x] Concurrency documentation for future multi-threading
 
-### ✅ **Threading Primitives - WTF-Compatible**
+### Threading Primitives
 - [x] Thread creation/destruction with proper lifecycle
 - [x] Mutex implementation using `SignalSemaphore`
 - [x] Condition variables with waiter management
@@ -149,7 +171,7 @@ This document tracks all changes made to the AmigaOS 3.x multitask library durin
 - **Output**: `libmultitask.a` (static library)
 - **Target**: AmigaOS 3.x native compilation
 
-### **Linux (GCC Cross-Compiler) - WebKit Building**
+### **Linux (GCC Cross-Compiler)**
 - **Compiler**: `m68k-amigaos-gcc` (cross-compiler)
 - **Target**: AmigaOS 3.x from Linux host
 - **Integration**: Link `libmultitask.a` into WTF/WebCore
@@ -203,16 +225,10 @@ aos_multithreading_library/
 - ✅ HTTP response parsing edge cases
 - ✅ Error code propagation and reporting
 
-### **Production Readiness**
+### **Design Goals**
 - ✅ No race conditions in thread creation
 - ✅ No resource leaks or stale handles
 - ✅ Comprehensive error handling and reporting
 - ✅ Professional HTTP client implementation
 - ✅ WTF-compatible memory management semantics
 - ✅ Build system with development warnings
-
----
-
-**Status**: 🚀 **100% PRODUCTION-READY FOR WEBKIT INTEGRATION** 🚀
-
-The library is now enterprise-grade and handles all edge cases. Ready to wire into WTF and begin browser bring-up!

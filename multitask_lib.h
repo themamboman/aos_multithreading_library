@@ -37,6 +37,7 @@ struct MyThread {
     BYTE doneSig;             /* Signal to signal parent when done */
     struct Node node;          /* For linking threads */
     volatile BOOL is_running;
+    volatile BOOL detached;
     void *tls_data[MAX_TLS_KEYS]; /* Thread-local storage data */
     struct MyThread *next;     /* For linking in lists */
 };
@@ -104,9 +105,10 @@ struct MyThread *MyThreadCreate(ThreadFunc func, void *arg);
 void MyThreadDestroy(struct MyThread *thread);
 BOOL MyThreadIsRunning(struct MyThread *thread); /* May lag behind actual thread state */
 void MyThreadWait(struct MyThread *thread);
+void MyThreadDetach(struct MyThread *thread);
 void MyThreadYield(void); /* Yield CPU time to other tasks */
 
-/* Note: Callers MUST call MyThreadWait() before MyThreadDestroy() */
+/* Destroy joined handles with MyThreadDestroy(); call detach from the creator task. */
 
 void MyMutexInit(struct MyMutex *mutex);
 void MyMutexLock(struct MyMutex *mutex);
@@ -124,6 +126,7 @@ void MyConditionWait(struct MyMutex *mutex, struct MyCondition *cond);
 void MyConditionSignal(struct MyCondition *cond);
 void MyConditionBroadcast(struct MyCondition *cond);
 void MyConditionDestroy(struct MyCondition *cond);
+BOOL MyConditionTimedWait(struct MyMutex *mutex, struct MyCondition *cond, ULONG timeout_ms);
 
 /* Thread-local storage functions */
 /* Note: MyTLSCreate() can fail if MAX_TLS_KEYS (32) is exceeded */
@@ -131,7 +134,7 @@ void MyConditionDestroy(struct MyCondition *cond);
 MyTLSKey MyTLSCreate(void);
 MyTLSKey MyTLSCreateWithDtor(MyTLSDtor dtor);
 void *MyTLSGet(MyTLSKey key);
-void MyTLSSet(MyTLSKey key, void *value);
+BOOL MyTLSSet(MyTLSKey key, void *value);
 void MyTLSDestroy(MyTLSKey key);
 
 /* Run all registered TLS destructors for the current thread */
@@ -154,7 +157,7 @@ void MyRunLoopRemoveTimer(struct MyRunLoop *loop, struct MyTimer *timer);
 void MyRunLoopDestroy(struct MyRunLoop *loop);
 
 /* Utility functions */
-ULONG amiga_now_ms(void); /* Monotonic time in milliseconds for WTF integration */
+ULONG amiga_now_ms(void); /* timer.device EClock, monotonic, sub-ms resolution; falls back to DOS DateStamp */
 
 /* Library open/close functions */
 struct MultitaskBase *MultitaskOpen(void);

@@ -6,25 +6,129 @@
 #include "multitask_lib.h"
 #include <proto/exec.h>
 #include <proto/dos.h>
+#include <dos/dostags.h>
+#include <dos/dosextens.h>
+#include <proto/timer.h>
+#include <devices/timer.h>
+#include <clib/alib_protos.h>
+
+/* Monotonic clock via timer.device's EClock.
+ *
+ * DOS DateStamp is wall-clock time and wraps around every ~19.4 days at
+ * 20 ms resolution, so it is useless as a monotonic source for timed waits
+ * and deadline arithmetic. timer.device's EClock is a free-running counter
+ * that never wraps during normal operation and is readable with a single
+ * trap. SysBase->ex_EClockFrequency is its rate in ticks per second, so
+ * the conversion to a millisecond counter needs no floating point.
+ */
+
+static struct Library *timer_base = NULL;
+/* TimerBase itself is already declared `extern struct Device *TimerBase;` by proto/timer.h --
+ * that's the exact global name/type the inline ReadEClock() stub hardcodes as the device base
+ * for its library call (same convention as SysBase/DOSBase/SocketBase). This is simply its
+ * definition; proto/timer.h's own extern declaration is what every other file sharing it sees. */
+struct Device *TimerBase = NULL;
+static struct MsgPort *timer_port = NULL;
+static struct timerequest timer_ioreq;
+static ULONG eclock_freq = 0;   /* EClock ticks per second */
+static BOOL timer_ok = FALSE;
+
+static void ensure_timer_opened(void)
+{
+    if (timer_ok)
+        return;
+
+    Forbid();
+    if (!timer_ok) {
+        timer_port = CreateMsgPort();
+        if (timer_port) {
+            /* OpenDevice() returns a BYTE error code (0 == success); it doesn't return the
+             * device base directly -- that's written into the IORequest's io_Device field. */
+            timer_ioreq.tr_node.io_Message.mn_ReplyPort = timer_port;
+            timer_ioreq.tr_node.io_Message.mn_Length = sizeof(timer_ioreq);
+            if (OpenDevice(TIMERNAME, UNIT_ECLOCK, &timer_ioreq.tr_node, 0) == 0) {
+                TimerBase = timer_ioreq.tr_node.io_Device;
+                timer_base = (struct Library *)TimerBase;
+                eclock_freq = (ULONG)SysBase->ex_EClockFrequency;
+                timer_ok = (eclock_freq > 0);
+            }
+        }
+    }
+    Permit();
+}
+
+ULONG amiga_now_ms(void)
+{
+    ensure_timer_opened();
+
+    if (timer_ok) {
+        struct EClockVal ev;
+        ReadEClock(&ev);
+        /* ev_hi:ev_lo is a 64-bit EClock tick count. Use 64-bit intermediates:
+           a machine left running accumulates ticks well beyond 32 bits. */
+        unsigned long long ticks = ((unsigned long long)ev.ev_hi << 32) | ev.ev_lo;
+        return (ULONG)((ticks * 1000ULL) / (unsigned long long)eclock_freq);
+    }
+
+    /* Fallback: DOS DateStamp (wall-clock, 20 ms resolution, not monotonic) */
+    struct DateStamp dateStamp;
+    DateStamp(&dateStamp);
+    return (ULONG)dateStamp.ds_Days * 86400000UL
+        + (ULONG)dateStamp.ds_Minute * 60000UL
+        + (ULONG)dateStamp.ds_Tick * 20UL;
+}
+
+/* Threads are created as DOS processes (CreateNewProc), not plain exec tasks:
+ * WebKit threads call dos.library (directly, or via clib2's printf/getenv/file
+ * I/O and libcurl), and dos.library may only be called from a Process.
+ *
+ * The new process can start running (and CreateNewProc itself may Wait() on
+ * DOS packets) before the creator could store anything in it, so the thread
+ * record is handed over through pending_thread: the creator holds create_sem,
+ * publishes the record, creates the process and waits until the child has
+ * picked it up (signalled with doneSig). */
+static struct SignalSemaphore create_sem;
+static volatile BOOL create_sem_initialized = FALSE;
+static struct MyThread *volatile pending_thread = NULL;
+
+static void ensure_create_sem_initialized(void)
+{
+    if (create_sem_initialized)
+        return;
+
+    Forbid();
+    if (!create_sem_initialized) {
+        InitSemaphore(&create_sem);
+        create_sem_initialized = TRUE;
+    }
+    Permit();
+}
 
 /* Thread entry point */
 static LONG MyThreadEntry(void)
 {
-    struct Task *self = FindTask(NULL);
-    struct MyThread *t = (struct MyThread *)self->tc_UserData;
-    
-    if (t && t->func) {
+    struct MyThread *t = pending_thread;
+
+    t->os_task = FindTask(NULL);
+    Signal(t->parent, 1L << t->doneSig);   /* tell creator we have the record */
+
+    if (t->func) {
         t->func(t->arg);
     }
-    
+
     /* NEW: run per-thread TLS destructors */
     MyTLSCallDestructorsForCurrentThread();
-    
+
+    /* Keep detach and process exit from racing over the thread record. Returning
+     * while forbidden is fine: DOS ends the process, which breaks the Forbid(). */
+    Forbid();
+    if (t->detached) {
+        FreeMem(t, sizeof(*t));
+        return 0;
+    }
     t->is_running = FALSE;
     Signal(t->parent, 1L << t->doneSig);   /* tell joiner we're done */
-    Forbid();                 /* ensure we don't get rescheduled mid-exit */
-    RemTask(NULL);            /* does not return */
-    return 0;                 /* never reached, but keeps compilers happy */
+    return 0;                 /* DOS cleans up the process */
 }
 
 /* Create a new thread */
@@ -42,32 +146,42 @@ struct MyThread *MyThreadCreate(ThreadFunc func, void *arg)
         return NULL;
     }
 
-    /* Create the AmigaOS task */
-    Forbid();  /* prevent scheduling until tc_UserData is set */
-    thread->os_task = CreateTask(
-        "MyThread",           /* Task name */
-        0,                    /* Priority */
-        (APTR)MyThreadEntry, /* Entry function */
-        8192                  /* Stack size */
-    );
-
-    if (!thread->os_task) {
-        Permit();
-        FreeSignal(thread->doneSig);
-        FreeMem(thread, sizeof(struct MyThread));
-        return NULL;
-    }
-
-    /* Set the user data so the task can retrieve its state */
-    thread->os_task->tc_UserData = (APTR)thread;
-    thread->is_running = TRUE;
-    Permit();
-    
     /* Initialize TLS data array */
     int i;
     for (i = 0; i < MAX_TLS_KEYS; i++) {
         thread->tls_data[i] = NULL;
     }
+    thread->is_running = TRUE;
+
+    /* Create the AmigaOS process (see pending_thread above) */
+    ensure_create_sem_initialized();
+    ObtainSemaphore(&create_sem);
+    pending_thread = thread;
+    SetSignal(0, 1L << thread->doneSig);
+    struct Process *proc = CreateNewProcTags(
+        NP_Entry, (ULONG)MyThreadEntry,
+        NP_Name, (ULONG)"MyThread",
+        NP_Priority, 0,
+        NP_StackSize, 2 * 1024 * 1024, /* was 256*1024; raised because
+                                          JSC::initializeThreading() spawns background
+                                          threads (GC/JIT pool) through this same path,
+                                          and JSC's C++ call chains are deep enough to
+                                          plausibly overflow 256KB, causing stack
+                                          corruption whose symptoms land at a different,
+                                          unpredictable point on each run. */
+        TAG_DONE);
+
+    if (!proc) {
+        pending_thread = NULL;
+        ReleaseSemaphore(&create_sem);
+        FreeSignal(thread->doneSig);
+        FreeMem(thread, sizeof(struct MyThread));
+        return NULL;
+    }
+
+    Wait(1L << thread->doneSig);    /* child has taken pending_thread and set os_task */
+    pending_thread = NULL;
+    ReleaseSemaphore(&create_sem);
 
     return thread;
 }
@@ -108,6 +222,22 @@ void MyThreadWait(struct MyThread *thread)
     }
 }
 
+void MyThreadDetach(struct MyThread *thread)
+{
+    if (!thread)
+        return;
+
+    Forbid();
+    thread->detached = TRUE;
+    if (thread->doneSig >= 0) {
+        FreeSignal(thread->doneSig);
+        thread->doneSig = -1;
+    }
+    if (!thread->is_running)
+        FreeMem(thread, sizeof(*thread));
+    Permit();
+}
+
 /* Yield CPU time to other tasks */
 void MyThreadYield(void)
 {
@@ -141,6 +271,7 @@ void MyMutexUnlock(struct MyMutex *mutex)
 /* Destroy a mutex */
 void MyMutexDestroy(struct MyMutex *mutex)
 {
+    (void)mutex;
     /* SignalSemaphore doesn't need explicit cleanup in AmigaOS */
 }
 
@@ -178,7 +309,7 @@ void MyPortPostMessage(MyMessagePort *my_port, struct Message *msg)
 void MyConditionInit(struct MyCondition *cond)
 {
     if (!cond) return;
-    NewList((struct List*)&cond->waiters);
+    NewMinList(&cond->waiters);
     InitSemaphore(&cond->guard);
 }
 
@@ -190,6 +321,7 @@ void MyConditionWait(struct MyMutex *mutex, struct MyCondition *cond)
     w.task = self;
     w.sigBit = AllocSignal(-1);
     if (w.sigBit < 0) return;
+    BYTE sigBit = w.sigBit;
     
     /* Note: Using stack-based waiter node. For timed waits or broadcast storms,
        consider heap-allocating the waiter to make lifetime explicit. */
@@ -199,8 +331,8 @@ void MyConditionWait(struct MyMutex *mutex, struct MyCondition *cond)
     ReleaseSemaphore(&cond->guard);
 
     ReleaseSemaphore(&mutex->sem);
-    Wait(1L << w.sigBit);
-    FreeSignal(w.sigBit);
+    Wait(1L << sigBit);
+    FreeSignal(sigBit);
     ObtainSemaphore(&mutex->sem);
 }
 
@@ -209,8 +341,12 @@ void MyConditionSignal(struct MyCondition *cond)
     if (!cond) return;
     ObtainSemaphore(&cond->guard);
     struct MyCondWaiter *w = (struct MyCondWaiter*)RemHead((struct List*)&cond->waiters);
+    if (w && w->task && w->sigBit >= 0) {
+        BYTE sigBit = w->sigBit;
+        w->sigBit = -1;
+        Signal(w->task, 1L << sigBit);
+    }
     ReleaseSemaphore(&cond->guard);
-    if (w && w->task && w->sigBit >= 0) Signal(w->task, 1L << w->sigBit);
 }
 
 void MyConditionBroadcast(struct MyCondition *cond)
@@ -219,9 +355,57 @@ void MyConditionBroadcast(struct MyCondition *cond)
     ObtainSemaphore(&cond->guard);
     struct MyCondWaiter *w;
     while ((w = (struct MyCondWaiter*)RemHead((struct List*)&cond->waiters))) {
-        if (w && w->task && w->sigBit >= 0) Signal(w->task, 1L << w->sigBit);
+        if (w && w->task && w->sigBit >= 0) {
+            BYTE sigBit = w->sigBit;
+            w->sigBit = -1;
+            Signal(w->task, 1L << sigBit);
+        }
     }
     ReleaseSemaphore(&cond->guard);
+}
+
+BOOL MyConditionTimedWait(struct MyMutex *mutex, struct MyCondition *cond, ULONG timeout_ms)
+{
+    if (!mutex || !cond) return FALSE;
+
+    struct Task *self = FindTask(NULL);
+    struct MyCondWaiter waiter = {0};
+    waiter.task = self;
+    waiter.sigBit = AllocSignal(-1);
+    if (waiter.sigBit < 0) return FALSE;
+
+    BYTE sigBit = waiter.sigBit;
+    ULONG signalMask = 1UL << sigBit;
+    ULONG deadline = amiga_now_ms() + timeout_ms;
+
+    ObtainSemaphore(&cond->guard);
+    AddTail((struct List*)&cond->waiters, (struct Node*)&waiter);
+    ReleaseSemaphore(&cond->guard);
+
+    ReleaseSemaphore(&mutex->sem);
+
+    BOOL timedOut = FALSE;
+    while (!(SetSignal(0, signalMask) & signalMask)) {
+        if ((LONG)(amiga_now_ms() - deadline) >= 0) {
+            timedOut = TRUE;
+            break;
+        }
+        Delay(1);
+    }
+
+    if (timedOut) {
+        ObtainSemaphore(&cond->guard);
+        if (waiter.sigBit >= 0) {
+            Remove((struct Node*)&waiter);
+            waiter.sigBit = -1;
+        } else
+            timedOut = FALSE;
+        ReleaseSemaphore(&cond->guard);
+    }
+
+    FreeSignal(sigBit);
+    ObtainSemaphore(&mutex->sem);
+    return !timedOut;
 }
 
 void MyConditionDestroy(struct MyCondition *cond) 
@@ -241,14 +425,34 @@ void MyConditionDestroy(struct MyCondition *cond)
 static struct SignalSemaphore tls_guard = {0};
 static UWORD next_tls_key = 0;
 static MyTLSDtor tls_dtors[MAX_TLS_KEYS]; /* parallel to tls_data[] */
+static volatile BOOL tls_initialized = FALSE;
+
+struct MyTaskTLS {
+    struct Task *task;
+    void *data[MAX_TLS_KEYS];
+    struct MyTaskTLS *next;
+};
+
+static struct MyTaskTLS *task_tls_list = NULL;
+
+static void ensure_tls_initialized(void)
+{
+    if (tls_initialized)
+        return;
+
+    Forbid();
+    if (!tls_initialized) {
+        InitSemaphore(&tls_guard);
+        tls_initialized = TRUE;
+    }
+    Permit();
+}
 
 MyTLSKey MyTLSCreateWithDtor(MyTLSDtor dtor)
 {
     MyTLSKey key;
-    
-    if (tls_guard.ss_Link.lh_Head == NULL) {
-        InitSemaphore(&tls_guard);
-    }
+
+    ensure_tls_initialized();
     
     ObtainSemaphore(&tls_guard);
     if (next_tls_key >= MAX_TLS_KEYS) {
@@ -268,43 +472,84 @@ MyTLSKey MyTLSCreate(void) { return MyTLSCreateWithDtor(NULL); }
 void *MyTLSGet(MyTLSKey key)
 {
     if (key >= MAX_TLS_KEYS || key == 0xFFFF) return NULL; /* Check for invalid key */
-    struct MyThread *current = (struct MyThread *)FindTask(NULL)->tc_UserData;
-    if (!current) return NULL;
-    return current->tls_data[key];
+    ensure_tls_initialized();
+
+    struct Task *task = FindTask(NULL);
+    ObtainSemaphore(&tls_guard);
+    struct MyTaskTLS *entry = task_tls_list;
+    while (entry && entry->task != task)
+        entry = entry->next;
+    void *value = entry ? entry->data[key] : NULL;
+    ReleaseSemaphore(&tls_guard);
+    return value;
 }
 
-void MyTLSSet(MyTLSKey key, void *value)
+BOOL MyTLSSet(MyTLSKey key, void *value)
 {
-    if (key >= MAX_TLS_KEYS || key == 0xFFFF) return; /* Check for invalid key */
-    struct MyThread *current = (struct MyThread *)FindTask(NULL)->tc_UserData;
-    if (!current) return;
-    current->tls_data[key] = value;
+    if (key >= MAX_TLS_KEYS || key == 0xFFFF) return FALSE;
+    ensure_tls_initialized();
+
+    struct Task *task = FindTask(NULL);
+    ObtainSemaphore(&tls_guard);
+    struct MyTaskTLS *entry = task_tls_list;
+    while (entry && entry->task != task)
+        entry = entry->next;
+    if (!entry && value) {
+        entry = (struct MyTaskTLS *)AllocMem(sizeof(*entry), MEMF_CLEAR);
+        if (entry) {
+            entry->task = task;
+            entry->next = task_tls_list;
+            task_tls_list = entry;
+        }
+    }
+    if (entry)
+        entry->data[key] = value;
+    ReleaseSemaphore(&tls_guard);
+    return entry || !value;
 }
 
 void MyTLSDestroy(MyTLSKey key)
 {
+    (void)key;
     /* For now, no cleanup needed */
 }
 
 /* Call per-thread destructors; allow a few passes like pthreads */
 void MyTLSCallDestructorsForCurrentThread(void)
 {
-    struct MyThread *current = (struct MyThread *)FindTask(NULL)->tc_UserData;
-    if (!current) return;
+    struct Task *task = FindTask(NULL);
+    ensure_tls_initialized();
 
     for (int pass = 0; pass < 4; ++pass) {  /* 4 is ample for common patterns */
         BOOL any = FALSE;
-        for (UWORD k = 0; k < next_tls_key; ++k) {
-            void *p = current->tls_data[k];
+        UWORD keyCount;
+        ObtainSemaphore(&tls_guard);
+        keyCount = next_tls_key;
+        ReleaseSemaphore(&tls_guard);
+        for (UWORD k = 0; k < keyCount; ++k) {
+            void *p = MyTLSGet(k);
+            ObtainSemaphore(&tls_guard);
             MyTLSDtor d = tls_dtors[k];
+            ReleaseSemaphore(&tls_guard);
             if (p && d) {
-                current->tls_data[k] = NULL; /* clear before calling dtor */
+                MyTLSSet(k, NULL); /* clear before calling dtor */
                 d(p);
                 any = TRUE;
             }
         }
         if (!any) break;
     }
+
+    ObtainSemaphore(&tls_guard);
+    struct MyTaskTLS **entry = &task_tls_list;
+    while (*entry && (*entry)->task != task)
+        entry = &(*entry)->next;
+    struct MyTaskTLS *finished = *entry;
+    if (finished)
+        *entry = finished->next;
+    ReleaseSemaphore(&tls_guard);
+    if (finished)
+        FreeMem(finished, sizeof(*finished));
 }
 
 /* Atomic operations implementation */
@@ -363,14 +608,6 @@ LONG MyAtomicCompareExchange(struct MyAtomic *atomic, LONG expected, LONG desire
 }
 
 /* Run loop implementation */
-/* Note: Using CurrentTime() as fallback. For better precision, consider EClock with timer.device */
-ULONG amiga_now_ms(void)
-{
-    ULONG s, us; 
-    CurrentTime(&s, &us); 
-    return s*1000UL + (us/1000UL);
-}
-
 static ULONG now_ms(void) {
     return amiga_now_ms();
 }
@@ -416,7 +653,9 @@ void MyRunLoopRemoveTimer(struct MyRunLoop *loop, struct MyTimer *timer)
 
 void MyRunLoopRun(struct MyRunLoop *loop)
 {
-    if (!loop) return; loop->running = TRUE;
+    if (!loop)
+        return;
+    loop->running = TRUE;
     while (loop->running) {
         // timers
         ULONG now = now_ms();

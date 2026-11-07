@@ -19,29 +19,29 @@ A basic multitasking library for Amiga OS3.x that provides thread management, sy
 
 ## Building
 
-### Prerequisites
+There are two ways to build it.
 
-- vbcc compiler (Amiga C compiler)
-- Amiga SDK headers
-- Make utility
+### Inside a larger project (cross-compiled)
 
-### Build Commands
+This is how OdysseyWebBrowser for AmigaOS 3.x uses it: `multitask_lib.c` is compiled straight into
+the project, with no separate library step. Tested with the AmigaPorts `m68k-amigaos-gcc`
+(GCC 16) and clib2:
 
 ```bash
-# Build the library
-make
+m68k-amigaos-gcc -mcpu=68040 -fbaserel -fno-pic -mcrt=clib2 -O1 -I. -c multitask_lib.c
+```
 
-# Build stubs only
-make stubs
+Add this directory to the include path so `multitask_lib.h` is found.
 
-# Build test program
-make test_program
+### Static library with vbcc (Makefile)
 
-# Clean build files
-make clean
+The Makefile builds `libmultitask.a` with vbcc (`vc`). It has not been re-tested since the
+changes for the browser port.
 
-# Install library (requires root access)
-make install
+```bash
+make                # build libmultitask.a
+make test_program   # build the threading test program
+make clean          # remove build files
 ```
 
 ## Usage
@@ -102,6 +102,7 @@ MyPortDestroy(port);
 - `MyThreadDestroy(thread)` - Destroy a thread
 - `MyThreadIsRunning(thread)` - Check if thread is active
 - `MyThreadWait(thread)` - Wait for thread completion
+- `MyThreadDetach(thread)` - Release a thread handle without joining; call from its creating task
 
 ### Mutex Functions
 
@@ -117,6 +118,13 @@ MyPortDestroy(port);
 - `MyPortWaitMessage(port)` - Wait for messages
 - `MyPortPostMessage(port, msg)` - Send a message
 
+### Condition and TLS Functions
+
+- `MyConditionTimedWait(mutex, condition, timeout_ms)` - Wait up to the relative timeout in milliseconds
+- `MyTLSSet(key, value)` - Set task-local data; returns `FALSE` if the key is invalid or storage cannot be allocated
+
+`MyTLSSet` supports both tasks created by this library and existing Amiga tasks. The task-local storage limit is currently `MAX_TLS_KEYS` (32).
+
 ## Library Management
 
 - `MultitaskOpen()` - Open the library
@@ -125,14 +133,16 @@ MyPortDestroy(port);
 ## Notes
 
 - This library is built on top of Amiga's native Exec kernel
-- Threads are implemented as Amiga tasks
+- Threads are created as DOS processes (`CreateNewProc`) with a 2 MB stack, so they can call
+  dos.library and C library I/O
+- `amiga_now_ms()` reads timer.device's EClock, falling back to DOS `DateStamp`
 - No memory protection - all threads share the same address space
 - Use mutexes to protect shared data
 - Message ports provide safe inter-task communication
 
 ## Testing
 
-Run the test program to verify the library works correctly:
+Build and run the test program on an AmigaOS 3.x target (or compatible emulator):
 
 ```bash
 make test_program
@@ -143,16 +153,19 @@ The test program demonstrates:
 - Creating multiple worker threads
 - Using mutexes for synchronization
 - Message passing between threads
-- Proper cleanup and resource management
+- Condition signaling and timed-out waits
+- Task-local TLS isolation and destructor calls
+- Repeated detached-thread cleanup
 
-## Porting to WebKit
+The library itself runs inside OdysseyWebBrowser on AmigaOS 3.x (tested under WinUAE), which
+exercises threads, mutexes, conditions, timed waits and TLS. `test_program` has been built but
+not yet run on its own.
 
-This library provides the basic threading primitives needed for porting WebKit to Amiga OS3.x:
+## Used by
 
-- **Thread Creation**: WebKit's worker threads can be implemented using `MyThreadCreate`
-- **Synchronization**: WebKit's locks and mutexes can use `MyMutex` functions
-- **Message Passing**: WebKit's inter-thread communication can use message ports
-- **Task Management**: Proper task lifecycle management for WebKit components
+- [OdysseyWebBrowser for AmigaOS 3.x (m68k)](https://github.com/themamboman/OdysseyWebBrowser-m68k):
+  WebKit's WTF threading layer (`Source/WTF/wtf/amiga/ThreadingAmiga.cpp`) maps threads, locks,
+  conditions and thread-local storage onto this library.
 
 ## License
 

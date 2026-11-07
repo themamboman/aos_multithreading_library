@@ -113,9 +113,9 @@ void *MyTLSGet(MyTLSKey key)
     return (void *)CallLibFunction((struct Library *)MultitaskBase, -138, key);
 }
 
-void MyTLSSet(MyTLSKey key, void *value)
+BOOL MyTLSSet(MyTLSKey key, void *value)
 {
-    CallLibFunction((struct Library *)MultitaskBase, -144, key, value);
+    return (BOOL)CallLibFunction((struct Library *)MultitaskBase, -144, key, value);
 }
 
 void MyTLSDestroy(MyTLSKey key)

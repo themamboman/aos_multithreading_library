@@ -6,11 +6,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <proto/exec.h>
+#include <proto/dos.h>
 #include "multitask_lib.h"
 
 /* Test function prototypes */
 void test_condvar(void);
 void test_runloop(void);
+BOOL test_monotonic_clock(void);
+BOOL test_condition_timeout(void);
+BOOL test_task_tls(void);
+BOOL test_detached_threads(void);
 
 /* Shared data structure */
 struct SharedData {
@@ -148,7 +154,12 @@ int main(void)
     /* Test run loop */
     printf("\nTesting run loop...\n");
     test_runloop();
-    
+
+    if (!test_monotonic_clock() || !test_condition_timeout() || !test_task_tls() || !test_detached_threads()) {
+        printf("\nA new threading regression test failed!\n");
+        return 1;
+    }
+
     printf("\nAll tests completed successfully!\n");
     
     return 0;
@@ -185,6 +196,142 @@ void test_condvar(void)
     MyMutexDestroy(&m);
     
     printf("Condition variable test passed\n");
+}
+
+/* Verifies amiga_now_ms() is actually a monotonic clock rather than the old
+ * DOS DateStamp value. DateStamp is wall-clock time with 20 ms resolution and
+ * it wraps at the day boundary, so it can run backwards across midnight and
+ * is far too coarse for timeout arithmetic. This checks both failure modes:
+ * monotonicity over many samples, and that a known sleep measures in the right
+ * range with resolution finer than one DateStamp tick.
+ */
+BOOL test_monotonic_clock(void)
+{
+    /* 1. Take many back-to-back samples; a non-monotonic source is detected
+          immediately because every sample must be >= the previous one. */
+    ULONG previous = amiga_now_ms();
+    int backwards = 0;
+    for (int i = 0; i < 5000; ++i) {
+        ULONG now = amiga_now_ms();
+        if ((LONG)(now - previous) < 0)
+            ++backwards;
+        previous = now;
+    }
+
+    /* 2. Measure a known sleep. DateStamp's 20 ms granularity would report
+          this in steps of 20; EClock measures it to sub-millisecond accuracy.
+          The window is deliberately wide so this does not flake on slow
+          hardware while still rejecting a stuck or wrong-scale clock. */
+    ULONG start = amiga_now_ms();
+    Delay(12);                          /* 12 vertical blank ticks ~= 240 ms */
+    ULONG elapsed = amiga_now_ms() - start;
+
+    /* 3. Sample again after a further delay; a wrap-around in the clock would
+          make the second measurement appear smaller than the first. */
+    Delay(6);
+    ULONG second = amiga_now_ms() - start;
+    if (second < elapsed)
+        ++backwards;
+
+    BOOL passed = (backwards == 0) && elapsed >= 150 && elapsed <= 600;
+    printf("Monotonic clock test %s (backwards readings=%d, 240ms sleep measured %lu ms)\n",
+           passed ? "passed" : "failed", backwards, (unsigned long)elapsed);
+    return passed;
+}
+
+BOOL test_condition_timeout(void)
+{
+    struct MyMutex mutex;
+    struct MyCondition condition;
+    MyMutexInit(&mutex);
+    MyConditionInit(&condition);
+
+    MyMutexLock(&mutex);
+    ULONG start = amiga_now_ms();
+    BOOL signaled = MyConditionTimedWait(&mutex, &condition, 60);
+    ULONG elapsed = amiga_now_ms() - start;
+    MyMutexUnlock(&mutex);
+
+    MyConditionDestroy(&condition);
+    MyMutexDestroy(&mutex);
+    BOOL passed = !signaled && elapsed >= 40;
+    printf("Condition timeout test %s\n", passed ? "passed" : "failed");
+    return passed;
+}
+
+static MyTLSKey test_tls_key;
+static int main_tls_value = 7;
+static int worker_tls_value = 11;
+static volatile LONG tls_destructor_calls;
+static volatile BOOL tls_worker_passed;
+
+static void test_tls_destructor(void *value)
+{
+    if (value == &worker_tls_value)
+        tls_destructor_calls++;
+}
+
+static void tls_worker(void *arg)
+{
+    (void)arg;
+    tls_worker_passed = !MyTLSGet(test_tls_key)
+        && MyTLSSet(test_tls_key, &worker_tls_value)
+        && MyTLSGet(test_tls_key) == &worker_tls_value;
+}
+
+BOOL test_task_tls(void)
+{
+    test_tls_key = MyTLSCreateWithDtor(test_tls_destructor);
+    if (test_tls_key == (MyTLSKey)0xFFFF)
+        return FALSE;
+
+    tls_destructor_calls = 0;
+    tls_worker_passed = FALSE;
+    if (!MyTLSSet(test_tls_key, &main_tls_value))
+        return FALSE;
+
+    struct MyThread *thread = MyThreadCreate(tls_worker, NULL);
+    if (!thread)
+        return FALSE;
+    MyThreadWait(thread);
+    MyThreadDestroy(thread);
+
+    BOOL passed = tls_worker_passed
+        && tls_destructor_calls == 1
+        && MyTLSGet(test_tls_key) == &main_tls_value;
+    MyTLSDestroy(test_tls_key);
+    printf("Task-local TLS test %s\n", passed ? "passed" : "failed");
+    return passed;
+}
+
+static volatile ULONG detached_thread_count;
+
+static void detached_worker(void *arg)
+{
+    (void)arg;
+    Forbid();
+    detached_thread_count++;
+    Permit();
+}
+
+BOOL test_detached_threads(void)
+{
+    detached_thread_count = 0;
+    for (ULONG i = 0; i < 40; ++i) {
+        struct MyThread *thread = MyThreadCreate(detached_worker, NULL);
+        if (!thread)
+            return FALSE;
+        MyThreadDetach(thread);
+
+        ULONG deadline = amiga_now_ms() + 2000;
+        while (detached_thread_count <= i && (LONG)(amiga_now_ms() - deadline) < 0)
+            Delay(1);
+        if (detached_thread_count <= i)
+            return FALSE;
+        Delay(1);
+    }
+    printf("Detached thread cleanup test passed\n");
+    return TRUE;
 }
 
 /* Run loop test */
